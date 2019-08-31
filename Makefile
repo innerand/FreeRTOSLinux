@@ -38,6 +38,9 @@ FreeRTOS/Source/portable/MemMang/heap_4.c
 SRCS += $(PORT_SOURCES)
 INCLUDE_DIRS += $(PORT_INCLUDE_DIRS)
 
+LDFLAGS += -lrt -lpthread
+CPPFLAGS += -g
+
 # Build files
 OBJS   := $(SRCS:%=$(BUILD_DIR)/%.o)
 DEPS   := $(OBJS:.o=.d)

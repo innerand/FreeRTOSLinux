@@ -1,28 +1,13 @@
 /*
- * FreeRTOS Kernel V10.2.0
- * Copyright (C) 2017 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
+ * FreeRTOS Port implementation for Linux using POSIX Threads
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy of
- * this software and associated documentation files (the "Software"), to deal in
- * the Software without restriction, including without limitation the rights to
- * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
- * the Software, and to permit persons to whom the Software is furnished to do so,
- * subject to the following conditions:
+ * TODO Describe usage
  *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
+ * Copyright (C) 2019 Andreas Innerlohninger <innerand@nxa.at>
+ * Copyright (C) 2019 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
  *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
- * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
- * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
- * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- *
- * http://www.FreeRTOS.org
- * http://aws.amazon.com/freertos
- *
- * 1 tab == 4 spaces!
+ * This code is subject to the terms and conditions defined at the MIT Licence
+ * which are specified at the end of this file and/or a separate license file.
  */
 
 
@@ -50,17 +35,21 @@ typedef unsigned long UBaseType_t;
 	not need to be guarded with a critical section. */
 	#define portTICK_TYPE_IS_ATOMIC 1
 #endif
+
+#define portPOINTER_SIZE_TYPE  uint64_t
+
+
 /*-----------------------------------------------------------*/
 
 /* Architecture specifics. */
 #define portSTACK_GROWTH			( -1 )
 #define portTICK_PERIOD_MS			( ( TickType_t ) 1000 / configTICK_RATE_HZ )
-#define portBYTE_ALIGNMENT			( 4 )
+#define portBYTE_ALIGNMENT			( 8 )
 /*-----------------------------------------------------------*/
 
 /* Scheduler utilities. */
-//TODO
-#define portYIELD()
+extern void vPortYield( void );
+#define portYIELD() vPortYield()
 #define portEND_SWITCHING_ISR( xSwitchRequired ) if( xSwitchRequired != pdFALSE ) portYIELD()
 #define portYIELD_FROM_ISR( x ) portEND_SWITCHING_ISR( x )
 /*-----------------------------------------------------------*/
@@ -70,8 +59,11 @@ typedef unsigned long UBaseType_t;
 #define portCLEAR_INTERRUPT_MASK_FROM_ISR(x)    (void)(x)
 #define portDISABLE_INTERRUPTS()
 #define portENABLE_INTERRUPTS()
-#define portENTER_CRITICAL()
-#define portEXIT_CRITICAL()
+
+extern void vPortEnterCritical( void );
+extern void vPortExitCritical( void );
+#define portENTER_CRITICAL() vPortEnterCritical()
+#define portEXIT_CRITICAL() vPortExitCritical()
 
 /*-----------------------------------------------------------*/
 
@@ -82,6 +74,10 @@ not necessary for to use this port.  They are defined so the common demo files
 #define portTASK_FUNCTION( vFunction, pvParameters ) void vFunction( void *pvParameters )
 /*-----------------------------------------------------------*/
 
+/* Task creation hook. Passes the task handle */
+void vPortSetupTCB(void * pvTaskHandle);
+#define portSETUP_TCB(pxTCB)    vPortSetupTCB((void*)pxTCB)
+/*-----------------------------------------------------------*/
 
 #ifdef __cplusplus
 }
@@ -90,3 +86,28 @@ not necessary for to use this port.  They are defined so the common demo files
 #endif /* PORTMACRO_H */
 
 
+
+/* Licence notice ----------------------------------------------------------- */
+
+/*
+ * MIT Licence
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ */
