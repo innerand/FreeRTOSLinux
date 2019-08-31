@@ -117,7 +117,7 @@ void vPortEnterCritical( void )
 
 void vPortExitCritical( void )
 {
-	if (uxCriticalNesting) { uxCriticalNesting--};
+	if (uxCriticalNesting) { uxCriticalNesting--;}
 
 	if( uxCriticalNesting == 0 ) {
 		xInterruptsDisabled = 0;

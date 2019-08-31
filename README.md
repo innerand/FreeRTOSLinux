@@ -2,7 +2,7 @@
 FreeRTOS port implementation for Linux using POSIX threads.
 For testing FreeRTOS projects on Linux systems.
 
-*** Early development state. Don't expect things to work ***
+***Early development state. Don't expect things to work***
 
 ## Getting Started
 Include the files inside the port folder into your FreeRTOS project
