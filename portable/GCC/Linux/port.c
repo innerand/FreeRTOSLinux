@@ -9,6 +9,10 @@
  * - and is handled synchronized within the main thread
  * - While systick is handled all threads running RTOS tasks are suspended
  *
+ * Debugging:
+ * - Content of pxTasks might be a good staring point. It holds the state of the
+ *   RTOS tasks and the corresponding thread id.
+ *
  *
  * Copyright (C) 2019 Andreas Innerlohninger <innerand@nxa.at>
  *
@@ -29,21 +33,18 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <semaphore.h>
 
 #include "FreeRTOS.h"
 #include "task.h"
 
 
-/* Private Defintions --------------------------------------------------------*/
+/* Private Definitions -------------------------------------------------------*/
 
 #define ERREXIT(s)  printf("Error: %s (%s[%d], %s)", (s), __FUNCTION__, __LINE__, __FILE__); exit(1)
 // #define LOG(msg,...) printf("[%ld]", prvGetNsTs()); printf(msg, ##__VA_ARGS__); printf("\n");
 #define LOG(msg,...)
 
-/* Signals */
-#define SIGTIMER    (SIGRTMIN + 1)
-#define SIGSUSPEND  SIGUSR1
-#define SIGRESUME   SIGUSR2
 
 /** Internal task credentials */
 typedef struct {
@@ -62,11 +63,16 @@ typedef struct {
 static void prvInit(void);
 static void prvStartSchedulerThread(void);
 static bool prvStartSystickTimer(void);
+static void prvStopSystickTimer(void);
 static void * prvSchedulerThread(void *arg);
 static void * prvTask(void * arg);
 static unsigned long prvGetNsTs(void);
-static int prvGetTaskIdFromHandle(TaskHandle_t handle);
+static int prvGetIdFromHandle(TaskHandle_t handle);
 static int prvGetIdFromThreadId(pthread_t id);
+static void prvSchedulerEndCleanup( void );
+static void prvSuspendTaskBlocking(int task_id);
+static void prvResumeTaskBlocking(int task_id);
+static void prvResumeSchedulerBlocking(void);
 
 static void prvSigResumeHandler(int sig, siginfo_t *si, void *uc);
 static void prvSigSuspendHandler(int sig, siginfo_t *si, void *uc);
@@ -76,24 +82,38 @@ static void prvSigtimerHandler(int sig, siginfo_t *si, void *uc);
 /* Private Variables ---------------------------------------------------------*/
 
 static volatile portTask_t pxTasks[configPORT_MAX_TASKS];
-static bool xEndScheduler = false;
 static int xLastCreatedTaskId = configPORT_MAX_TASKS;
-static bool xInitialized = false;
 
 /* Context switch IDs */
-static volatile int xThreadToResume = configPORT_MAX_TASKS;
-static volatile int xThreadToSuspend = configPORT_MAX_TASKS;
+static volatile int xTaskToResume = configPORT_MAX_TASKS;
+static volatile int xTaskToSuspend = configPORT_MAX_TASKS;
 
 /* System Threads */
 static pthread_t xMainThreadId;
 static pthread_t xSchedulerThreadId;
-static pthread_mutex_t xSchedulerMutex;
+static int xIdleTaskId;
+
+/* Semaphores */
+static sem_t xSchedulerSem;     /* Scheduler available  */
+static sem_t xResumeSem;        /* (Any) Task has resumed */
+static sem_t xSuspendSem;       /* (Any) Task is suspended */
+static sem_t xCriticalSem;      /* Critical section */
+
+/* Mutexes */
+static pthread_mutex_t xSchedulerMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t xSchedulerCond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t xSchedulerStartedMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t xSchedulerStartedCond = PTHREAD_COND_INITIALIZER;
 
 /* Flags */
+static bool xEndScheduler = false;
 static volatile sig_atomic_t xSystick = 0;
-static volatile sig_atomic_t xInterruptsDisabled = 0;
 static volatile sig_atomic_t xTimerTickPending = 0;
-static volatile bool xSchedulerResumed;
+static volatile bool xYieldPending = false;
+static volatile bool xResumeScheduler = false;
+static volatile bool xSchedulerStarted = false;
+static volatile bool xPaused = false;
+static bool xInitialized = false;
 
 /* A variable is used to keep track of the critical section nesting.  This
 variable has to be stored as part of the task context and must be xInitialized
@@ -102,30 +122,84 @@ before the scheduler starts.  As it is stored as part of the task context it
 will automatically be set to 0 when the first task is started. */
 static UBaseType_t uxCriticalNesting = 0xaaaaaaaa;
 
-/* Delay of the resend of a signal if it wasn't confirmed */
-const struct timespec xSignalResendDelay = { .tv_sec = 0, .tv_nsec = 5000 };
+static timer_t xSystickTimerId;
 
+/* Signal mask used by the prvSigResumeHandler */
+static sigset_t xSuspendMask;
 
 /* Public Functions ----------------------------------------------------------*/
 
+/*
+ * Stop all tasks and disable 'interrupts' (stop systick handling)
+ */
+void vPortPause ( void ) {
+    /* Block until the scheduler has been started */
+    pthread_mutex_lock(&xSchedulerStartedMutex);
+    while (xSchedulerStarted == false) {
+        pthread_cond_wait(&xSchedulerStartedCond, &xSchedulerStartedMutex);
+    }
+    pthread_mutex_unlock(&xSchedulerStartedMutex);
+
+    /* No pause during critical section */
+    while (sem_wait(&xCriticalSem));
+
+    /* No Pause while context switch ongoing */
+    while (sem_wait(&xSchedulerSem));
+
+    xPaused = true;
+
+    /* End running task */
+    if (pxTasks[xTaskToResume].xUsed) {
+        prvSuspendTaskBlocking(xTaskToResume);
+    }
+
+    /* All tasks are stopped by now */
+    sem_post(&xSchedulerSem);
+    sem_post(&xCriticalSem);
+}
+/*-----------------------------------------------------------*/
+
+/*
+ * Resume task execution stopped by vPortPause()
+ */
+void vPortResume ( void ) {
+    if (xPaused) {
+        xPaused = false;
+        prvResumeTaskBlocking(xTaskToResume);
+    }
+}
+/*-----------------------------------------------------------*/
+
 void vPortEnterCritical( void )
 {
-    xInterruptsDisabled = 1;
-	uxCriticalNesting++;
+    if (uxCriticalNesting == 0)  {
+        while (sem_wait(&xCriticalSem));
+    }
+
+    uxCriticalNesting++;
 }
 /*-----------------------------------------------------------*/
 
 void vPortExitCritical( void )
 {
-	if (uxCriticalNesting) { uxCriticalNesting--;}
+    if (uxCriticalNesting == 1) {
+        sem_post(&xCriticalSem);
+    }
 
-	if( uxCriticalNesting == 0 ) {
-		xInterruptsDisabled = 0;
+    if (uxCriticalNesting) { uxCriticalNesting--; }
+
+    if( uxCriticalNesting == 0 && !xPaused) {
+
         if (xTimerTickPending) {
-            pthread_kill(xMainThreadId, SIGTIMER);
+            pthread_kill(xMainThreadId, portSIGTIMER);
             xTimerTickPending = 0;
         }
-	}
+
+        if (xYieldPending) {
+            xYieldPending = false;
+            vPortYield();
+        }
+    }
 }
 /*-----------------------------------------------------------*/
 
@@ -153,8 +227,6 @@ StackType_t *pxPortInitialiseStack(
         ERREXIT("All threads occupied. Increase configPORT_MAX_TASKS");
     }
 
-    LOG("[INFO] Creating Task with ID %d", idx);
-
     /* Initialize task credentials */
     pxTasks[idx].xUsed = true;
     pxTasks[idx].xSuspended = true;
@@ -167,10 +239,9 @@ StackType_t *pxPortInitialiseStack(
     /* Temporarily block all signals (SIGMASK is inherited to threads) */
     sigset_t block, restore;
     sigfillset(&block);
-    sigdelset(&block, SIGINT);
 
-    if (sigprocmask(SIG_BLOCK, &block, &restore) != 0) {
-        ERREXIT("sigprocmask block all");
+    if (pthread_sigmask(SIG_BLOCK, &block, &restore) != 0) {
+        ERREXIT("pthread_sigmask block all");
     }
 
     /* Create Thread */
@@ -178,11 +249,14 @@ StackType_t *pxPortInitialiseStack(
             (void*)&pxTasks[idx]);
 
     /* Restore previous signal mask */
-    if (sigprocmask(SIG_BLOCK, &restore, NULL) != 0) {
-        ERREXIT("sigprocmask restore");
+    if (pthread_sigmask(SIG_SETMASK, &restore, NULL) != 0) {
+        ERREXIT("pthread_sigmask restore");
     }
 
-	return ( StackType_t * ) pxTopOfStack;
+    /*  Wait for created task to suspend */
+    while (sem_wait(&xSuspendSem));
+
+    return ( StackType_t * ) pxTopOfStack;
 }
 /*-----------------------------------------------------------*/
 
@@ -194,11 +268,58 @@ void vPortSetupTCB(void * pvTaskHandle) {
 
     if (xLastCreatedTaskId < configPORT_MAX_TASKS) {
         pxTasks[xLastCreatedTaskId].pxHandle = handle;
-        LOG("[INFO] Received handle of Task ID %d", xLastCreatedTaskId);
         xLastCreatedTaskId = configPORT_MAX_TASKS;
     } else {
-        LOG("[ERR] Received task handle while id was invalid");
+        ERREXIT("Received task handle while id was invalid");
     }
+}
+/*-----------------------------------------------------------*/
+
+/*
+ * Task delete callback. End task, cleanup task credentials
+ */
+void vPortCleanUpTCB(void * pvTaskHandle) {
+    int id = prvGetIdFromHandle((TaskHandle_t)pvTaskHandle);
+
+    /* Check if the task handle was valid */
+    if (id >= configPORT_MAX_TASKS) {
+        ERREXIT("Cleanup: Received invalid task handle");
+    }
+
+    /* ------------------------------- */
+    vPortEnterCritical();
+    /* ------------------------------- */
+
+    /*
+     * If vTaskEndScheduler is called outside of RTOS tasks the idle task ends
+     * itself.
+     */
+    if (pxTasks[id].xThreadId == pthread_self()) {
+        if (id == xIdleTaskId) {
+            pthread_exit(NULL);
+        } else {
+            ERREXIT("Cleanup: Tried to cancel active task");
+        }
+    }
+
+    /* End thread running the task to delete */
+    pthread_cancel(pxTasks[id].xThreadId);
+
+    /*
+     * Wait for thread to terminate, except the Idle thread which is joined at
+     * the main thread
+     */
+    if (id != xIdleTaskId) {
+        if (pthread_join(pxTasks[id].xThreadId, NULL) != 0) {
+            ERREXIT("Cleanup: Unable to join");
+        }
+    }
+
+    pxTasks[id].xUsed = false;
+
+    /* ------------------------------- */
+    vPortExitCritical();
+    /* ------------------------------- */
 }
 /*-----------------------------------------------------------*/
 
@@ -207,81 +328,119 @@ void vPortSetupTCB(void * pvTaskHandle) {
  */
 BaseType_t xPortStartScheduler( void )
 {
-    /* Main thread/Scheduler */
-    LOG("[INFO] Starting scheduler.. ");
-
     xMainThreadId = pthread_self();
 
-    if (pthread_mutex_init(&xSchedulerMutex, NULL) != 0) {
-        ERREXIT("mutex init");
+    /* Get idle task id
+     *
+     * The idle task is the first task created by vTaskStartScheduler
+     */
+    int task_id_max = -1;
+    for (int task = 1; task < configPORT_MAX_TASKS; task++) {
+        if (!pxTasks[task].xUsed) {
+            task_id_max = task -1;
+            break;
+        }
     }
 
+    if (task_id_max < 0) {
+        ERREXIT("Unable to find max task id");
+    }
+
+    #if ( configUSE_TIMERS == 1 )
+        task_id_max--;
+    #endif
+
+    xIdleTaskId = task_id_max;
+
+    /* Start scheduler, systick and enable interrupts */
     prvStartSchedulerThread();
     prvStartSystickTimer();
     uxCriticalNesting = 0;
 
     /* Resume first task */
-    xThreadToResume = prvGetTaskIdFromHandle(xTaskGetCurrentTaskHandle());
+    xTaskToResume = prvGetIdFromHandle(xTaskGetCurrentTaskHandle());
 
     /* Check if thread exists and is enabled */
-    if ((xThreadToResume >= configPORT_MAX_TASKS) ||
-        (pxTasks[xThreadToResume].xUsed == false)) {
+    if ((xTaskToResume >= configPORT_MAX_TASKS) ||
+        (pxTasks[xTaskToResume].xUsed == false)) {
         ERREXIT("Tried to resume invalid thread");
     }
 
-    LOG("[INFO] Resuming first RTOS Task (%d)", xThreadToResume);
-    if (pthread_kill(pxTasks[xThreadToResume].xThreadId, SIGRESUME) != 0) {
-        LOG("[ERR] Couldn't send signal SIGRESUME");
-    };
+    prvResumeTaskBlocking(xTaskToResume);
 
-    /* This thread does nothing but handle the Systick */
-    while(!xEndScheduler) {
-        pause();
+    /* Signal scheduler started */
+    pthread_mutex_lock(&xSchedulerStartedMutex);
+    xSchedulerStarted = true;
+    pthread_mutex_unlock(&xSchedulerStartedMutex);
+    pthread_cond_signal(&xSchedulerStartedCond);
+
+    /* Handle Systicks */
+    while (!xEndScheduler) {
 
         /* Process system tick */
-        if (xSystick) {
-            xSystick = 0;
+        if (xSystick && !xPaused) {
 
-            /* Make sure there is no ongoing task switch */
-            pthread_mutex_lock(&xSchedulerMutex);
-
-            /* Suspend active thread */
-            do {
-                pthread_kill(pxTasks[xThreadToResume].xThreadId, SIGSUSPEND);
-                nanosleep(&xSignalResendDelay, NULL);
-            } while (!pxTasks[xThreadToResume].xSuspended);
-
-            /* All RTOS task should be suspended by now */
-            pthread_mutex_unlock(&xSchedulerMutex);
+            vPortPause();
 
             /* Increment tick, check if context switch is required */
+            xSystick = 0;
             if (xTaskIncrementTick() == pdTRUE) {
+                xPaused = false;
                 vPortYield();
+            } else {
+                vPortResume();
             }
-
-            pthread_mutex_lock(&xSchedulerMutex);
-            while (pxTasks[xThreadToResume].xSuspended) {
-                pthread_kill(pxTasks[xThreadToResume].xThreadId, SIGRESUME);
-                nanosleep(&xSignalResendDelay, NULL);
-            }
-
-            // tasks_sanity_check();
-            pthread_mutex_unlock(&xSchedulerMutex);
         }
-    }
 
-	return pdTRUE;
+        pause();
+
+    } /* Main thread loop */
+
+    prvSchedulerEndCleanup();
+
+    return pdTRUE;
 }
 /*-----------------------------------------------------------*/
+
 
 /*
  *  End scheduler
  */
 void vPortEndScheduler( void )
 {
+    #if  ( INCLUDE_vTaskDelete == 1 )
+    /* Avoid task switch by timer interrupt */
+    vPortEnterCritical();
+
+    /* Set Scheduler ended */
+    pthread_mutex_lock(&xSchedulerStartedMutex);
+    xSchedulerStarted = false;
+    pthread_mutex_unlock(&xSchedulerStartedMutex);
+
+    /* End scheduler, exit main thread loop */
     xEndScheduler = true;
-    /* TODO */
-    ERREXIT("unimplemented");
+
+    /* Delete every task except idle task which may be required for cleanup */
+    for (int task = 0; task < configPORT_MAX_TASKS; task++) {
+        if (pxTasks[task].xUsed && task != xIdleTaskId) {
+            vTaskDelete(pxTasks[task].pxHandle);
+        }
+    }
+
+    /* End Scheduler Task */
+    prvResumeSchedulerBlocking();
+
+    /* If called within RTOS Task, exit this thread */
+    pthread_t current = pthread_self();
+    for (int task = 0; task < configPORT_MAX_TASKS; task++) {
+        if (pxTasks[task].xThreadId == current) {
+            pthread_exit(NULL);
+        }
+    }
+
+    #else
+    ERREXIT("End Scheduler requires vTaskDelete");
+    #endif
 }
 /*-----------------------------------------------------------*/
 
@@ -289,41 +448,28 @@ void vPortEndScheduler( void )
  *  Task switch
  */
 void vPortYield( void ) {
-    /* Unlock is done at scheduler thread */
-    pthread_mutex_lock(&xSchedulerMutex);
+    /* Post is done at scheduler thread */
+    while (sem_wait(&xSchedulerSem));
 
-    /* Currently running task */
-    xThreadToSuspend = prvGetTaskIdFromHandle(xTaskGetCurrentTaskHandle());
+    prvResumeSchedulerBlocking();
 
-    /* Check if thread exists and is enabled */
-    if (xThreadToSuspend >= configPORT_MAX_TASKS ||
-        pxTasks[xThreadToSuspend].xUsed == false) {
-        ERREXIT("Tried to suspend invalid thread");
-    }
-
-    vTaskSwitchContext();
-
-    /* Task to run after actual task switch */
-    xThreadToResume = prvGetTaskIdFromHandle(xTaskGetCurrentTaskHandle());
-
-    /* Check if thread exists and is enabled */
-    if (xThreadToResume >= configPORT_MAX_TASKS ||
-        pxTasks[xThreadToResume].xUsed == false) {
-        ERREXIT("Tried to resume invalid thread");
-    }
-
-    /* Resume scheduler thread */
-    xSchedulerResumed = false;
-    do {
-        pthread_kill(xSchedulerThreadId, SIGRESUME);
-        struct timespec ts;
-        nanosleep(&xSignalResendDelay, NULL);
-    } while (!xSchedulerResumed);
-
-    /* Stop current thread */
-    if (pthread_self() != xMainThreadId &&
-        xThreadToResume != xThreadToSuspend) {
+    /* Suspend this task */
+    if (pthread_self() != xMainThreadId) {
         pause();
+    }
+
+    return;
+}
+/*-----------------------------------------------------------*/
+
+/*
+ *  Delayed context switch
+ */
+void vPortYieldWithinAPI( void )  {
+    if (uxCriticalNesting || xPaused) {
+        xYieldPending = true;
+    } else {
+        vPortYield();
     }
 }
 /*-----------------------------------------------------------*/
@@ -332,49 +478,128 @@ void vPortYield( void ) {
 /* Private Functions ---------------------------------------------------------*/
 
 /*
- * Initialize global functions and register signal handlers
+ * Cleanup after scheduler has ended
+ *
+ * Run at main thread after vTaskEndScheduler has been called
+ */
+static void prvSchedulerEndCleanup( void ) {
+    struct timespec xDelayTs = { .tv_sec = 0, .tv_nsec = 100000 };
+
+    /* Resume the idle task */
+    prvResumeTaskBlocking(xIdleTaskId);
+
+    /* Wait for all tasks to be deleted and removed (except idle) */
+    bool tasks_deleted = false;
+    while (!tasks_deleted) {
+        nanosleep(&xDelayTs, NULL);
+
+        int count = 0;
+        for (int task = 0; task < configPORT_MAX_TASKS; task++) {
+            if (pxTasks[task].xUsed) { count++; };
+        }
+
+        if (count <= 1) {
+            tasks_deleted = true;
+        }
+    }
+
+    /* Finally delete the idle task */
+    vTaskDelete(pxTasks[xIdleTaskId].pxHandle);
+
+    /* Wait for the idle task to exit */
+    if (pthread_join(pxTasks[xIdleTaskId].xThreadId, NULL) != 0) {
+        ERREXIT("Cleanup: Unable to join");
+    }
+
+    /* End scheduler thread */
+    pthread_cancel(xSchedulerThreadId);
+    if (pthread_join(xSchedulerThreadId, NULL) != 0) {
+        ERREXIT("Cleanup: Unable to join");
+    }
+
+    /* Stop the systick timer */
+    prvStopSystickTimer();
+
+    sem_destroy(&xSchedulerSem);
+    sem_destroy(&xResumeSem);
+    sem_destroy(&xSuspendSem);
+    sem_destroy(&xCriticalSem);
+
+    xInitialized = false;
+
+    /* Reinitialize memory management */
+    vPortInitialiseBlocks();
+}
+/*-----------------------------------------------------------*/
+
+
+/*
+ * Initialize global variables, semaphores  and register signal handlers
  */
 static void prvInit(void) {
 
     /* Initialize global variables */
     /* --------------------------- */
-
     memset((void *)&pxTasks, 0, sizeof(pxTasks));
     xEndScheduler = false;
     xLastCreatedTaskId = configPORT_MAX_TASKS;
+    xTaskToResume = configPORT_MAX_TASKS;
+    xTaskToSuspend = configPORT_MAX_TASKS;
 
-    xThreadToResume = configPORT_MAX_TASKS;
-    xThreadToSuspend = configPORT_MAX_TASKS;
-
-    pthread_t xMainThreadId = 0;
-    pthread_t xSchedulerThreadId = 0;
+    xMainThreadId = 0;
+    xSchedulerThreadId = 0;
 
     xSystick = 0;
-    xInterruptsDisabled = 0;
     xTimerTickPending = 0;
-    xSchedulerResumed = false;
     uxCriticalNesting = 0xaaaaaaaa;
+
+    pthread_mutex_lock(&xSchedulerStartedMutex);
+    xSchedulerStarted = false;
+    pthread_mutex_unlock(&xSchedulerStartedMutex);
+
+    /* Initialize semaphores */
+    /* --------------------- */
+    if (sem_init(&xSchedulerSem, 0, 1) != 0) {
+        ERREXIT("sem init");
+    }
+
+    if (sem_init(&xResumeSem, 0, 0) != 0) {
+        ERREXIT("sem init");
+    }
+
+    if (sem_init(&xSuspendSem, 0, 0) != 0) {
+        ERREXIT("sem init");
+    }
+
+    if (sem_init(&xCriticalSem, 0, 1) != 0) {
+        ERREXIT("sem init");
+    }
+
+    /* Setup suspend mask */
+    /* ------------------ */
+    sigfillset(&xSuspendMask);
+    sigdelset(&xSuspendMask, portSIGRESUME);
 
     /* Register Signal Handlers */
     /* ------------------------ */
     struct sigaction sa;
 
-    /* Register (empty) Handler for SIGRESUME */
+    /* Register (empty) Handler for portSIGRESUME */
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART | SA_SIGINFO;
     sa.sa_sigaction = prvSigResumeHandler;
 
-    if (sigaction(SIGRESUME, &sa, NULL) == -1) {
-        ERREXIT("SIGRESUME handler");
+    if (sigaction(portSIGRESUME, &sa, NULL) == -1) {
+        ERREXIT("portSIGRESUME handler");
     }
 
-    /* Register Handler for SIGSUSPEND */
+    /* Register Handler for portSIGSUSPEND */
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART | SA_SIGINFO;
     sa.sa_sigaction = prvSigSuspendHandler;
 
-    if (sigaction(SIGSUSPEND, &sa, NULL) == -1) {
-        ERREXIT("SIGSUSPEND handler");
+    if (sigaction(portSIGSUSPEND, &sa, NULL) == -1) {
+        ERREXIT("portSIGSUSPEND handler");
     }
 
     /* Establish handler for timer signal */
@@ -382,7 +607,7 @@ static void prvInit(void) {
     sa.sa_flags = SA_RESTART | SA_SIGINFO;
     sa.sa_sigaction = prvSigtimerHandler;
 
-    if (sigaction(SIGTIMER, &sa, NULL) == -1) {
+    if (sigaction(portSIGTIMER, &sa, NULL) == -1) {
         ERREXIT("sigaction");
     }
 
@@ -391,7 +616,7 @@ static void prvInit(void) {
 /*-----------------------------------------------------------*/
 
 /*
- * SIGRESUME Handler
+ * portSIGRESUME Handler
  */
 static void prvSigResumeHandler(int sig, siginfo_t *si, void *uc) {
     /* nothing to do here */
@@ -402,40 +627,48 @@ static void prvSigResumeHandler(int sig, siginfo_t *si, void *uc) {
 /*-----------------------------------------------------------*/
 
 /*
- * SIGSUSPEND Handler
+ * portSIGSUSPEND Handler
  */
 static void prvSigSuspendHandler(int sig, siginfo_t *si, void *uc) {
-    sigset_t suspend_mask;
-    sigfillset(&suspend_mask);
-    sigdelset(&suspend_mask, SIGRESUME);
 
     pthread_t thread_id = pthread_self();
     int id = prvGetIdFromThreadId(thread_id);
 
     if (id >= configPORT_MAX_TASKS) {
-        LOG("[FATAL] Suspend handler invalid id");
-        return;
+        ERREXIT("Suspend handler invalid id");
     }
 
     pxTasks[id].xSuspended = true;
+    sem_post(&xSuspendSem);
 
-    /* Suspend the thread until SIGRESUME is received */
-    sigsuspend(&suspend_mask);
+    /* Suspend the thread until portSIGRESUME is received */
+    sigsuspend(&xSuspendMask);
 
     pxTasks[id].xSuspended = false;
+    sem_post(&xResumeSem);
+
+    /* Compiler warnings */
+    (void) sig;
+    (void) si;
+    (void) uc;
 }
 /*-----------------------------------------------------------*/
 
 /*
- * SIGTIMER handler
+ * portSIGTIMER handler
  */
 static void prvSigtimerHandler(int sig, siginfo_t *si, void *uc) {
     /* Pend tick if timer is disabled */
-    if (xInterruptsDisabled > 0) {
+    if (uxCriticalNesting || xPaused) {
         xTimerTickPending = 1;
     } else {
         xSystick = 1;
     }
+
+    /* Compiler warnings */
+    (void) sig;
+    (void) si;
+    (void) uc;
 }
 /*-----------------------------------------------------------*/
 
@@ -449,54 +682,71 @@ static void prvStartSchedulerThread(void) {
 
 
 /*
- * Scheduler pausing/resuming RTOS tasks
+ * Scheduler suspends/resumes RTOS tasks
  */
 static void * prvSchedulerThread(void *arg) {
     /* Set Signal Mask */
-    sigset_t schedulerset;
-    sigfillset(&schedulerset);
-    sigdelset(&schedulerset, SIGRESUME);
-    sigdelset(&schedulerset, SIGINT);
+    sigset_t maskset;
+    sigfillset(&maskset);
 
-    if (sigprocmask(SIG_SETMASK, &schedulerset, NULL) != 0) {
-        ERREXIT("sigprocmask taskset");
+    if (pthread_sigmask(SIG_SETMASK, &maskset, NULL) != 0) {
+        ERREXIT("pthread_sigmask taskset");
     }
 
-    LOG("[INFO] Scheduler thread started");
-    while(!xEndScheduler) {
-        /* Wait for next context switch */
-        sigsuspend(&schedulerset);
-        xSchedulerResumed = true;
+    while (1) {
 
-        /* Suspend thread */
-        if ((xThreadToSuspend < configPORT_MAX_TASKS) &&
-            (pxTasks[xThreadToSuspend].xUsed)) {
+        /* Wait for a Yield */
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
-            if (!pxTasks[xThreadToSuspend].xSuspended) {
-                do {
-                    pthread_kill(pxTasks[xThreadToSuspend].xThreadId,
-                                 SIGSUSPEND);
-                    nanosleep(&xSignalResendDelay, NULL);
-                } while(!pxTasks[xThreadToSuspend].xSuspended);
-            }
+        pthread_mutex_lock(&xSchedulerMutex);
+        while (xResumeScheduler != true) {
+            pthread_cond_wait(&xSchedulerCond, &xSchedulerMutex);
+        }
+        xResumeScheduler = false;
+        pthread_mutex_unlock(&xSchedulerMutex);
+
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+
+        /* Check if scheduler scheduler should exit */
+        if (xEndScheduler) { break; }
+
+        /* Currently running task */
+        xTaskToSuspend = prvGetIdFromHandle(xTaskGetCurrentTaskHandle());
+
+        /* Check if thread exists and is enabled */
+        if (xTaskToSuspend >= configPORT_MAX_TASKS ||
+            pxTasks[xTaskToSuspend].xUsed == false) {
+            ERREXIT("Tried to suspend invalid thread");
+        }
+
+        vTaskSwitchContext();
+
+        /* Task to run after actual task switch */
+        xTaskToResume = prvGetIdFromHandle(xTaskGetCurrentTaskHandle());
+
+        /* Check if thread exists and is enabled */
+        if (xTaskToResume >= configPORT_MAX_TASKS ||
+            pxTasks[xTaskToResume].xUsed == false) {
+            ERREXIT("Tried to resume invalid thread");
+        }
+
+        /* Perform context switch */
+        if (!pxTasks[xTaskToSuspend].xSuspended) {
+            /* Suspend thread */
+            prvSuspendTaskBlocking(xTaskToSuspend);
         }
 
         /* Resume thread */
-        if ((xThreadToResume < configPORT_MAX_TASKS) &&
-            pxTasks[xThreadToResume].xUsed) {
+        prvResumeTaskBlocking(xTaskToResume);
 
-            if (pxTasks[xThreadToResume].xSuspended != 0) {
-                while(pxTasks[xThreadToResume].xSuspended) {
-                    pthread_kill(pxTasks[xThreadToResume].xThreadId, SIGRESUME);
-                    nanosleep(&xSignalResendDelay, NULL);
-                };
-            }
-        }
-
-        pthread_mutex_unlock(&xSchedulerMutex);
+        /* Unlock scheduler */
+        sem_post(&xSchedulerSem);
     }
 
-    LOG("[INFO] Scheduler thread exited..");
+    pthread_exit(NULL);
+
+    /* Compiler warning */
+    (void) arg;
 }
 /*-----------------------------------------------------------*/
 
@@ -509,33 +759,37 @@ static void * prvTask(void * arg) {
     /* Set Signal Mask */
     sigset_t taskset;
     sigfillset(&taskset);
-    sigdelset(&taskset, SIGSUSPEND);
-    sigdelset(&taskset, SIGRESUME);
+    sigdelset(&taskset, portSIGSUSPEND);
     sigdelset(&taskset, SIGINT);
 
-    if (sigprocmask(SIG_SETMASK, &taskset, NULL) != 0) {
-        ERREXIT("sigprocmask taskset");
+    if (pthread_sigmask(SIG_SETMASK, &taskset, NULL) != 0) {
+        ERREXIT("pthread_sigmask taskset");
     }
 
     /* Suspend thread */
-    LOG("[INFO] RTOS task thread %d started", id->id);
-    pthread_kill(id->xThreadId, SIGSUSPEND);
+    pthread_kill(id->xThreadId, portSIGSUSPEND);
 
-    /* First Resume - check if initialization was done */
+    /* First resume, check if initialization was done */
     if (id->pxHandle == NULL) {
         ERREXIT("RTOS Task misses task handle");
     }
 
     /* RTOS Task function (shouldn't return, but might) */
     /* ------------------------------------------------ */
-    LOG("[INFO] Starting RTOS task function of thread %d", id->id);
     id->pxCode(id->pvParameters);
 
 
     /* Thread termination */
     /* ------------------ */
-    LOG("[INFO] Exited RTOS task thread %d", id->id);
-    // TODO RTOS Cleanup
+    LOG("[WARN] RTOS task %d returned", id->xId);
+
+    #if (INCLUDE_vTaskDelete == 1)
+        /* Task will be removed by the idle task */
+        vTaskDelete(NULL);
+        pthread_kill(id->xThreadId, portSIGSUSPEND);
+    #else
+        ERREXIT("RTOS Task returned");
+    #endif
 
     pthread_exit(NULL);
 }
@@ -545,34 +799,32 @@ static void * prvTask(void * arg) {
  * Initialize and start systick timer
  */
 static bool prvStartSystickTimer(void) {
-    timer_t timerid;
     struct sigevent sev;
     struct itimerspec its;
     long long freq_nanosecs;
-    sigset_t mask;
 
-    /* Unblock SIGTIMER */
+    /* Unblock portSIGTIMER */
     sigset_t timer_set;
     sigemptyset(&timer_set);
-    sigaddset(&timer_set, SIGTIMER);
+    sigaddset(&timer_set, portSIGTIMER);
     sigaddset(&timer_set, SIGINT);
 
-    if (sigprocmask(SIG_UNBLOCK, &timer_set, NULL) != 0) {
-        ERREXIT("sigprocmask timer");
+    if (pthread_sigmask(SIG_UNBLOCK, &timer_set, NULL) != 0) {
+        ERREXIT("pthread_sigmask timer");
     }
 
     /* Create the timer */
     memset(&sev, 0, sizeof(struct sigevent));
     sev.sigev_notify = SIGEV_SIGNAL;
-    sev.sigev_signo = SIGTIMER;
-    sev.sigev_value.sival_ptr = &timerid;
-    if (timer_create(CLOCK_MONOTONIC, &sev, &timerid) == -1) {
+    sev.sigev_signo = portSIGTIMER;
+    sev.sigev_value.sival_ptr = &xSystickTimerId;
+    if (timer_create(CLOCK_MONOTONIC, &sev, &xSystickTimerId) == -1) {
         ERREXIT("timer_create");
     }
 
     /* Start the timer */
     /* TODO make frequency configurable */
-    freq_nanosecs = 100000;
+    freq_nanosecs = 1000000;
     memset(&its, 0, sizeof(struct itimerspec));
 
     its.it_interval.tv_sec = freq_nanosecs / 1000000000;
@@ -580,16 +832,22 @@ static bool prvStartSystickTimer(void) {
     its.it_value.tv_sec = its.it_interval.tv_sec;
     its.it_value.tv_nsec = its.it_interval.tv_nsec;
 
-    if (timer_settime(timerid, 0, &its, NULL) == -1) {
+    if (timer_settime(xSystickTimerId, 0, &its, NULL) == -1) {
         ERREXIT("timer_settime");
     }
 
-    LOG("[INFO] Systick timer started");
     return true;
 }
 /*-----------------------------------------------------------*/
 
-
+/*
+ * Stop systick timer
+ */
+static void prvStopSystickTimer(void) {
+    if (timer_delete(xSystickTimerId) != 0) {
+        ERREXIT("Unable to stop timer");
+    }
+}
 
 /* Helper Functions */
 /* -------------------------------------------------------------------------- */
@@ -597,7 +855,7 @@ static bool prvStartSystickTimer(void) {
 /*
  * Get internal task id from RTOS task handle
  */
-static int prvGetTaskIdFromHandle(TaskHandle_t handle) {
+static int prvGetIdFromHandle(TaskHandle_t handle) {
     int idx = configPORT_MAX_TASKS;
 
     for (int i = 0; i < configPORT_MAX_TASKS; i++) {
@@ -605,10 +863,6 @@ static int prvGetTaskIdFromHandle(TaskHandle_t handle) {
             idx = i;
             break;
         }
-    }
-
-    if (idx >= configPORT_MAX_TASKS) {
-        LOG("[ERR] Couldn't find requested Task handle");
     }
 
     return idx;
@@ -628,10 +882,6 @@ static int prvGetIdFromThreadId(pthread_t id) {
         }
     }
 
-    if (idx >= configPORT_MAX_TASKS) {
-        LOG("[ERR] Couldn't find requested thread id");
-    }
-
     return idx;
 }
 /*-----------------------------------------------------------*/
@@ -640,7 +890,7 @@ static int prvGetIdFromThreadId(pthread_t id) {
 /*
  * Get nanosecond timestamp (process clock)
  */
-static unsigned long prvGetNsTs(void) {
+__attribute__((unused)) static unsigned long prvGetNsTs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
 
@@ -649,11 +899,49 @@ static unsigned long prvGetNsTs(void) {
 /*-----------------------------------------------------------*/
 
 
+/* Send portSIGRESUME to task and block until it is resumed */
+static void prvResumeTaskBlocking(int task_id) {
 
-/* Licence notice ----------------------------------------------------------- */
+    pthread_kill(pxTasks[task_id].xThreadId, portSIGRESUME);
+    while ( sem_wait(&xResumeSem) );
+
+    /* There can only be one task */
+    int semval;
+    sem_getvalue(&xResumeSem, &semval);
+    if (semval) {
+        ERREXIT("Resumed multiple tasks");
+    }
+}
+/*-----------------------------------------------------------*/
+
+/* Send portSIGSUSPEND to task and block until it is suspended */
+static void prvSuspendTaskBlocking(int task_id) {
+    pthread_kill(pxTasks[task_id].xThreadId, portSIGSUSPEND);
+    while (sem_wait(&xSuspendSem));
+}
+/*-----------------------------------------------------------*/
 
 /*
- * MIT Licence
+ * Resume the scheduler thread
+ */
+static void prvResumeSchedulerBlocking(void) {
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+
+    /* Resume Scheduler Task */
+    pthread_mutex_lock(&xSchedulerMutex);
+    xResumeScheduler = true;
+    pthread_mutex_unlock(&xSchedulerMutex);
+    pthread_cond_signal(&xSchedulerCond);
+
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+}
+/*-----------------------------------------------------------*/
+
+
+/* License notice ----------------------------------------------------------- */
+
+/*
+ * MIT License
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal

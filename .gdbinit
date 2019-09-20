@@ -1,6 +1,5 @@
-handle SIG35 nostop
-handle SIG35 noprint
-handle SIGUSR1 nostop
-handle SIGUSR1 noprint
-handle SIGUSR2 nostop
-handle SIGUSR2 noprint
+handle SIG32 nostop
+handle SIG35 nostop noprint
+handle SIG36 nostop noprint
+handle SIG37 nostop noprint
+set print pretty

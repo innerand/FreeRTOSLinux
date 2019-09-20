@@ -17,7 +17,7 @@ make
 
 ## Versioning
 [SemVer](http://semver.org/) is used for versioning. For the versions available,
-see the [tags on this repository](https://github.com/your/project/tags)
+see the [tags on this repository](https://github.com/innerand/FreeRTOSLinux/tags)
 
 
 ## License

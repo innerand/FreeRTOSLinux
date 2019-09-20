@@ -18,6 +18,18 @@
 extern "C" {
 #endif
 
+/*
+ * Signals used by the port
+ *
+ * If the application uses multiple threads this signals must be blocked and no
+ * signal handler must be installed for them
+ */
+#define portSIGTIMER    (SIGRTMIN + 1)
+#define portSIGSUSPEND  (SIGRTMIN + 2)
+#define portSIGRESUME   (SIGRTMIN + 3)
+#define portSIGSCHEDULE (SIGRTMIN + 4)
+/*-----------------------------------------------------------*/
+
 /* Type definitions. */
 #define portSTACK_TYPE	uint32_t
 typedef portSTACK_TYPE StackType_t;
@@ -36,8 +48,13 @@ typedef unsigned long UBaseType_t;
 	#define portTICK_TYPE_IS_ATOMIC 1
 #endif
 
-#define portPOINTER_SIZE_TYPE  uint64_t
-
+#if defined( __x86_64__)
+    #define portPOINTER_SIZE_TYPE  uint64_t
+#elif defined( __i386__ )
+    #define portPOINTER_SIZE_TYPE  uint32_t
+#else
+    #error "Pointer size type unknown"
+#endif
 
 /*-----------------------------------------------------------*/
 
@@ -52,6 +69,23 @@ extern void vPortYield( void );
 #define portYIELD() vPortYield()
 #define portEND_SWITCHING_ISR( xSwitchRequired ) if( xSwitchRequired != pdFALSE ) portYIELD()
 #define portYIELD_FROM_ISR( x ) portEND_SWITCHING_ISR( x )
+
+extern void vPortYieldWithinAPI( void );
+#define portYIELD_WITHIN_API() vPortYieldWithinAPI()
+
+/*
+ * Pauses execution off all tasks, disables systick handling
+ *
+ * May be useful to call *FromISR RTOS functions outside of the RTOS context
+ * NOTE: If the scheduler hasn't been started, this function will block until it
+ *       is.
+ */
+extern void vPortPause( void );
+
+/*
+ * Resumes task execution and systick handling after vPortPause()
+ */
+extern void vPortResume ( void );
 /*-----------------------------------------------------------*/
 
 /* Critical section management. */
@@ -64,6 +98,7 @@ extern void vPortEnterCritical( void );
 extern void vPortExitCritical( void );
 #define portENTER_CRITICAL() vPortEnterCritical()
 #define portEXIT_CRITICAL() vPortExitCritical()
+
 
 /*-----------------------------------------------------------*/
 
@@ -79,6 +114,9 @@ void vPortSetupTCB(void * pvTaskHandle);
 #define portSETUP_TCB(pxTCB)    vPortSetupTCB((void*)pxTCB)
 /*-----------------------------------------------------------*/
 
+void vPortCleanUpTCB(void * pvTaskHandle);
+#define portCLEAN_UP_TCB(pxTCB) vPortCleanUpTCB((void*) pxTCB)
+
 #ifdef __cplusplus
 }
 #endif
@@ -87,10 +125,10 @@ void vPortSetupTCB(void * pvTaskHandle);
 
 
 
-/* Licence notice ----------------------------------------------------------- */
+/* License notice ----------------------------------------------------------- */
 
 /*
- * MIT Licence
+ * MIT License
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
