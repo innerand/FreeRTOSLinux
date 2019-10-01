@@ -38,8 +38,8 @@ portable/GCC/Linux/heap_4.c
 SRCS += $(PORT_SOURCES)
 INCLUDE_DIRS += $(PORT_INCLUDE_DIRS)
 
-LDFLAGS += -lrt -lpthread
-CPPFLAGS += -ggdb -Wall -Wextra -Wundef -Wshadow
+LDFLAGS += -lrt -lpthread -lstdc++ -T freertos_linux.ld
+CPPFLAGS += -ggdb -Wall -Wextra -Wundef -Wshadow -fpermissive
 
 # Build files
 OBJS   := $(SRCS:%=$(BUILD_DIR)/%.o)

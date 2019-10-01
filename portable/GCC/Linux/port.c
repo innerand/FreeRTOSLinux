@@ -22,7 +22,6 @@
 
 
 /* Includes ------------------------------------------------------------------*/
-
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -37,10 +36,10 @@
 
 #include "FreeRTOS.h"
 #include "task.h"
+#include "queue.h"
 
 
 /* Private Definitions -------------------------------------------------------*/
-
 #define ERREXIT(s)  printf("Error: %s (%s[%d], %s)", (s), __FUNCTION__, __LINE__, __FILE__); exit(1)
 // #define LOG(msg,...) printf("[%ld]", prvGetNsTs()); printf(msg, ##__VA_ARGS__); printf("\n");
 #define LOG(msg,...)
@@ -56,6 +55,16 @@ typedef struct {
     TaskFunction_t pxCode;    /* RTOS task function */
     void * pvParameters;      /* RTOS function parameters */
 } portTask_t;
+
+/** Port task command definition */
+typedef enum {
+   EndScheduler = 0,
+} portCmd_t;
+
+/** Port task command data structure (may be extended) */
+typedef struct {
+    portCmd_t cmd;
+} portTaskCmd_t;
 
 
 /* Private Function declarations ---------------------------------------------*/
@@ -73,6 +82,9 @@ static void prvSchedulerEndCleanup( void );
 static void prvSuspendTaskBlocking(int task_id);
 static void prvResumeTaskBlocking(int task_id);
 static void prvResumeSchedulerBlocking(void);
+static void prvPortTask(void * pvParamters);
+static void prvEndScheduler(void);
+bool prvIsRtosContext(pthread_t thread_id);
 
 static void prvSigResumeHandler(int sig, siginfo_t *si, void *uc);
 static void prvSigSuspendHandler(int sig, siginfo_t *si, void *uc);
@@ -98,6 +110,7 @@ static sem_t xSchedulerSem;     /* Scheduler available  */
 static sem_t xResumeSem;        /* (Any) Task has resumed */
 static sem_t xSuspendSem;       /* (Any) Task is suspended */
 static sem_t xCriticalSem;      /* Critical section */
+static sem_t xPauseSem;         /* Scheduler Pause */
 
 /* Mutexes */
 static pthread_mutex_t xSchedulerMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -127,7 +140,48 @@ static timer_t xSystickTimerId;
 /* Signal mask used by the prvSigResumeHandler */
 static sigset_t xSuspendMask;
 
+static QueueHandle_t xPortTaskCmdQueue;
+
 /* Public Functions ----------------------------------------------------------*/
+
+/* Early Initialization
+ *
+ * Must be called from the main thread before any RTOS functions are called
+ */
+int vPortEarlyInit( void ) {
+    sigset_t blockset;
+    sigemptyset(&blockset);
+    sigaddset(&blockset, portSIGTIMER);
+    sigaddset(&blockset, portSIGSUSPEND);
+    sigaddset(&blockset, portSIGRESUME);
+    sigaddset(&blockset, portSIGSCHEDULE);
+
+    pthread_sigmask(SIG_BLOCK, &blockset, NULL);
+
+    return 0;
+}
+
+#if (configPORT_USE_REINIT != 0)
+/* Reinitialize static variables of the FreeRTOS Kernel
+ *
+ * Static variables of the FreeRTOS kernel are declared with the macro
+ * PRIVILEGED_DATA. This macro can be used by this port to put them into a
+ * dedicated memory section which is set to 0 by this function.
+ * The result should be a quite clean state of the kernel.
+ */
+void vPortReinitFreeRtos(void) {
+    extern char __free_rtos_start__;
+    extern char __free_rtos_stop__;
+    char * start = &__free_rtos_start__;
+    char * end = &__free_rtos_stop__;
+    size_t bytes = ((intptr_t)end - (intptr_t)start);
+
+    memset(start, 0, bytes);
+
+//    printf("Memory section 'free_rtos':\n"
+//           "start: %p, end: %p, size: %d\n", start, end, bytes);
+}
+#endif
 
 /*
  * Stop all tasks and disable 'interrupts' (stop systick handling)
@@ -139,6 +193,9 @@ void vPortPause ( void ) {
         pthread_cond_wait(&xSchedulerStartedCond, &xSchedulerStartedMutex);
     }
     pthread_mutex_unlock(&xSchedulerStartedMutex);
+
+    /* */
+    while (sem_wait(&xPauseSem));
 
     /* No pause during critical section */
     while (sem_wait(&xCriticalSem));
@@ -163,7 +220,9 @@ void vPortPause ( void ) {
  * Resume task execution stopped by vPortPause()
  */
 void vPortResume ( void ) {
-    if (xPaused) {
+    sem_post(&xPauseSem);
+
+    if (xPaused && !xEndScheduler) {
         xPaused = false;
         prvResumeTaskBlocking(xTaskToResume);
     }
@@ -173,7 +232,15 @@ void vPortResume ( void ) {
 void vPortEnterCritical( void )
 {
     if (uxCriticalNesting == 0)  {
-        while (sem_wait(&xCriticalSem));
+        while (sem_wait(&xCriticalSem)) {
+            /*
+             * The Thread may be suspended while waiting for the semaphore.
+             * If a other thread has meanwhile entered critical section,
+             * therefore obtained the semaphore, it's not longer necessary to
+             * wait for it.
+             */
+            if (uxCriticalNesting != 0) { break; }
+        }
     }
 
     uxCriticalNesting++;
@@ -296,6 +363,11 @@ void vPortCleanUpTCB(void * pvTaskHandle) {
      */
     if (pxTasks[id].xThreadId == pthread_self()) {
         if (id == xIdleTaskId) {
+            /* Note: Technically we leak memory here as the idle tasks stack is
+             *       freed after the call to vPortCleanUpTCB.
+             *       However, as the heap gets reinitialized anyway we don't
+             *       care.
+             */
             pthread_exit(NULL);
         } else {
             ERREXIT("Cleanup: Tried to cancel active task");
@@ -306,7 +378,7 @@ void vPortCleanUpTCB(void * pvTaskHandle) {
     pthread_cancel(pxTasks[id].xThreadId);
 
     /*
-     * Wait for thread to terminate, except the Idle thread which is joined at
+     * Wait for thread to terminate, except the idle thread which is joined at
      * the main thread
      */
     if (id != xIdleTaskId) {
@@ -352,6 +424,27 @@ BaseType_t xPortStartScheduler( void )
 
     xIdleTaskId = task_id_max;
 
+    /* Create internal service task */
+    xPortTaskCmdQueue = xQueueCreate(4, sizeof(portTaskCmd_t));
+
+    if (xPortTaskCmdQueue == NULL) {
+        ERREXIT("Unable to create port task command queue");
+    }
+
+    TaskHandle_t xPortTaskHdl;
+    BaseType_t xRet = xTaskCreate(
+            prvPortTask,
+            "PortTask",
+            configMINIMAL_STACK_SIZE,
+            (void*) NULL,
+            1,
+            &xPortTaskHdl);
+
+    if (xRet != pdPASS) {
+        ERREXIT("Unable to create port task");
+    }
+    /* --------------------------- */
+
     /* Start scheduler, systick and enable interrupts */
     prvStartSchedulerThread();
     prvStartSystickTimer();
@@ -384,8 +477,10 @@ BaseType_t xPortStartScheduler( void )
 
             /* Increment tick, check if context switch is required */
             xSystick = 0;
-            if (xTaskIncrementTick() == pdTRUE) {
+            if (xTaskIncrementTick() == pdTRUE || xYieldPending) {
                 xPaused = false;
+                xYieldPending = false;
+                sem_post(&xPauseSem);
                 vPortYield();
             } else {
                 vPortResume();
@@ -402,45 +497,28 @@ BaseType_t xPortStartScheduler( void )
 }
 /*-----------------------------------------------------------*/
 
-
 /*
- *  End scheduler
+ *  End scheduler public interface
  */
-void vPortEndScheduler( void )
-{
-    #if  ( INCLUDE_vTaskDelete == 1 )
-    /* Avoid task switch by timer interrupt */
-    vPortEnterCritical();
+void vPortEndScheduler( void ) {
+    BaseType_t higherPrioWoken;
+    portTaskCmd_t cmd;
+    cmd.cmd = EndScheduler;
 
-    /* Set Scheduler ended */
-    pthread_mutex_lock(&xSchedulerStartedMutex);
-    xSchedulerStarted = false;
-    pthread_mutex_unlock(&xSchedulerStartedMutex);
+    if (prvIsRtosContext(pthread_self())) {
+        xQueueSend(xPortTaskCmdQueue, &cmd, portMAX_DELAY);
+    } else {
+        /* Check if the scheduler has been paused already */
+        bool paused = xPaused;
 
-    /* End scheduler, exit main thread loop */
-    xEndScheduler = true;
-
-    /* Delete every task except idle task which may be required for cleanup */
-    for (int task = 0; task < configPORT_MAX_TASKS; task++) {
-        if (pxTasks[task].xUsed && task != xIdleTaskId) {
-            vTaskDelete(pxTasks[task].pxHandle);
-        }
+        if (!paused) { vPortPause(); }
+        xQueueSendFromISR(xPortTaskCmdQueue,
+                          &cmd,
+                          &higherPrioWoken);
+        // TODO: Implement yield from ISR
+        // portYIELD_FROM_ISR(higherPrioWoken);
+        if (!paused) { vPortResume(); }
     }
-
-    /* End Scheduler Task */
-    prvResumeSchedulerBlocking();
-
-    /* If called within RTOS Task, exit this thread */
-    pthread_t current = pthread_self();
-    for (int task = 0; task < configPORT_MAX_TASKS; task++) {
-        if (pxTasks[task].xThreadId == current) {
-            pthread_exit(NULL);
-        }
-    }
-
-    #else
-    ERREXIT("End Scheduler requires vTaskDelete");
-    #endif
 }
 /*-----------------------------------------------------------*/
 
@@ -524,6 +602,7 @@ static void prvSchedulerEndCleanup( void ) {
     sem_destroy(&xResumeSem);
     sem_destroy(&xSuspendSem);
     sem_destroy(&xCriticalSem);
+    sem_destroy(&xPauseSem);
 
     xInitialized = false;
 
@@ -572,6 +651,10 @@ static void prvInit(void) {
     }
 
     if (sem_init(&xCriticalSem, 0, 1) != 0) {
+        ERREXIT("sem init");
+    }
+
+    if (sem_init(&xPauseSem, 0, 1) != 0) {
         ERREXIT("sem init");
     }
 
@@ -936,6 +1019,93 @@ static void prvResumeSchedulerBlocking(void) {
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 }
 /*-----------------------------------------------------------*/
+
+/*
+ * Port Task
+ *
+ * This task is use to allow safely execution of non-*FromISR called from
+ * outside of RTOS context.
+ */
+static void prvPortTask(void * pvParameters) {
+    portTaskCmd_t cmd;
+
+    for (;;) {
+        /* Wait for new commands */
+        xQueueReceive(
+                xPortTaskCmdQueue,
+                &cmd,
+                portMAX_DELAY);
+
+        switch (cmd.cmd) {
+            case EndScheduler:
+                vQueueDelete(xPortTaskCmdQueue);
+                prvEndScheduler();
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    (void) pvParameters;
+}
+/*-----------------------------------------------------------*/
+
+/*
+ * Implementation of End Scheduler
+ *
+ * FIXME: If the task calling prvEndScheduler is of a higher priority as the
+ *        tasks created afterwards starting the scheduler fails.
+ *        The last aktive task seen by the kernel should be the idle task (with
+ *        priority 0).
+ */
+static void prvEndScheduler(void) {
+    #if  ( INCLUDE_vTaskDelete == 1 )
+    /* Avoid task switch by timer interrupt */
+    vPortEnterCritical();
+
+    /* Set Scheduler ended */
+    pthread_mutex_lock(&xSchedulerStartedMutex);
+    xSchedulerStarted = false;
+    pthread_mutex_unlock(&xSchedulerStartedMutex);
+
+    /* Delete every task except idle task which may be required for cleanup */
+    for (int task = 0; task < configPORT_MAX_TASKS; task++) {
+        if (pxTasks[task].xUsed && task != xIdleTaskId) {
+            vTaskDelete(pxTasks[task].pxHandle);
+        }
+    }
+
+    /* End scheduler, exit main thread loop */
+    xEndScheduler = true;
+
+    /* End Scheduler Task */
+    prvResumeSchedulerBlocking();
+
+    /* If called within RTOS Task, exit this thread */
+    if (prvIsRtosContext(pthread_self())) {
+        pthread_exit(NULL);
+    }
+
+    #else
+    ERREXIT("End Scheduler requires vTaskDelete");
+    #endif
+}
+
+/*-----------------------------------------------------------*/
+
+/*
+ * Tests if the `thread_id` is running a RTOS task
+ */
+bool prvIsRtosContext(pthread_t thread_id) {
+    for (int i = 0; i < configPORT_MAX_TASKS; i++) {
+        if (pxTasks[i].xThreadId == thread_id) { return true; }
+    }
+
+    return false;
+}
+/*-----------------------------------------------------------*/
+
 
 
 /* License notice ----------------------------------------------------------- */

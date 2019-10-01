@@ -22,7 +22,8 @@ extern "C" {
  * Signals used by the port
  *
  * If the application uses multiple threads this signals must be blocked and no
- * signal handler must be installed for them
+ * signal handler must be installed for them. Blocking those signals ist done by
+ * vPortEarlyInit().
  */
 #define portSIGTIMER    (SIGRTMIN + 1)
 #define portSIGSUSPEND  (SIGRTMIN + 2)
@@ -63,6 +64,31 @@ typedef unsigned long UBaseType_t;
 #define portTICK_PERIOD_MS			( ( TickType_t ) 1000 / configTICK_RATE_HZ )
 #define portBYTE_ALIGNMENT			( 8 )
 /*-----------------------------------------------------------*/
+
+/* Early Initialization
+ *
+ * Must be called from the main thread before any RTOS functions are called
+ *
+ * @retval 0        Initialized
+ * @retval (other)  Error
+ */
+int vPortEarlyInit( void );
+
+
+#if ( configPORT_USE_REINIT != 0 )
+/* Reinitialize static variables of FreeRTOS
+ *
+ * May be useful to get a clean state at runtime (e.g. when running multiple,
+ * independent tests)
+ *
+ * Requires linkage with `freertos_linx.ld` and define `PRIVILEGED_DATA`
+ * commented out at the end of the file mpu_wrappers.h
+ */
+void vPortReinitFreeRtos(void);
+#define PRIVILEGED_DATA __attribute__((section ("free_rtos")))
+
+#endif /* configPORT_USE_REINIT */
+
 
 /* Scheduler utilities. */
 extern void vPortYield( void );

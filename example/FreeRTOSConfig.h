@@ -4,6 +4,7 @@
 #include <assert.h>
 
 /* Port related definitions */
+#define configPORT_USE_REINIT                       ( 0 )
 #define configPORT_MAX_TASKS                        ( 10 )
 
 #define configUSE_PREEMPTION                        ( 1 )
