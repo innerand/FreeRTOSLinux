@@ -164,7 +164,7 @@ int main() {
         printf("Stop scheduler internal OK.\n");
     }
 
-    return;
+    return 0;
 
     /* Start some tasks */
     if( xTaskCreate(task_one, "task1", 128, (void*) 1, 3, NULL) != pdTRUE) {

@@ -44,9 +44,11 @@ typedef unsigned long UBaseType_t;
 	typedef uint32_t TickType_t;
 	#define portMAX_DELAY ( TickType_t ) 0xffffffffUL
 
+    #if defined(__i386__)
 	/* 32-bit tick type on a 32-bit architecture, so reads of the tick count do
 	not need to be guarded with a critical section. */
 	#define portTICK_TYPE_IS_ATOMIC 1
+    #endif
 #endif
 
 #if defined( __x86_64__)
@@ -102,7 +104,7 @@ extern void vPortYieldWithinAPI( void );
 /*
  * Pauses execution off all tasks, disables systick handling
  *
- * May be useful to call *FromISR RTOS functions outside of the RTOS context
+ * May be useful to call *FromISR FreeRTOS functions outside of the RTOS context
  * NOTE: If the scheduler hasn't been started, this function will block until it
  *       is.
  */
@@ -124,8 +126,6 @@ extern void vPortEnterCritical( void );
 extern void vPortExitCritical( void );
 #define portENTER_CRITICAL() vPortEnterCritical()
 #define portEXIT_CRITICAL() vPortExitCritical()
-
-
 /*-----------------------------------------------------------*/
 
 /* Task function macros as described on the FreeRTOS.org WEB site.  These are
