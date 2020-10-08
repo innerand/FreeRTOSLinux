@@ -1,3 +1,9 @@
+# There is an official Linux Port since FreeRTOS 10.4.0
+https://www.freertos.org/2020/09/freertos-kernel-v10-4-0-is-now-available.html
+
+***This project is deprecated and won't be continued***
+
+
 # FreeRTOS Linux Port 
 FreeRTOS port implementation for Linux using POSIX threads.
 Made to test FreeRTOS projects on Linux systems.
